@@ -1,0 +1,26 @@
+[
+  {
+    "name": "Netflix",
+    "amount": 15.49,
+    "day_of_month": 15,
+    "enabled": true
+  },
+  {
+    "name": "Spotify",
+    "amount": 10.99,
+    "day_of_month": 8,
+    "enabled": true
+  },
+  {
+    "name": "Electric Bill",
+    "amount": 85.00,
+    "day_of_month": 20,
+    "enabled": true
+  },
+  {
+    "name": "Gym",
+    "amount": 25.00,
+    "day_of_month": 1,
+    "enabled": true
+  }
+]

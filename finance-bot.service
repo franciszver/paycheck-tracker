@@ -1,0 +1,13 @@
+[Unit]
+Description=Finance Discord Bot
+After=network.target
+
+[Service]
+User=YOUR_USERNAME
+WorkingDirectory=/home/YOUR_USERNAME/paycheck-tracker
+ExecStart=/usr/bin/python3 /home/YOUR_USERNAME/paycheck-tracker/discord_bot.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

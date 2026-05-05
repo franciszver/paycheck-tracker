@@ -1,0 +1,6 @@
+plaid-python>=20.0.0
+flask>=3.0.0
+holidays>=0.46
+python-dotenv>=1.0.0
+mcp>=1.0.0
+discord.py>=2.0.0

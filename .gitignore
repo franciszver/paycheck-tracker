@@ -1,0 +1,23 @@
+# Secrets — never commit these
+secrets.env
+.env
+
+# Database contains your real transaction data
+transactions.db
+
+# Logs and backups
+logs/*.log
+backups/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# macOS
+.DS_Store
