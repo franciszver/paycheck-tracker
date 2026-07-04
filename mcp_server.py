@@ -7,7 +7,8 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 from bill_utils import (
     find_bill_payment, resolve_due_date, resolve_amount, load_one_time_items,
-    _txn_effective_date, get_manual_paid_names, get_ignored_bill_names,
+    get_manual_paid_names, get_ignored_bill_names,
+    txns_near_due, load_month_transactions,
 )
 
 BASE_DIR = Path(__file__).parent
@@ -242,37 +243,21 @@ def get_bills_status(month: str = None) -> dict:
     else:
         year, mo = today.year, today.month
 
-    month_start = str(date(year, mo, 1))
+    month_start = date(year, mo, 1)
     next_mo = mo + 1 if mo < 12 else 1
     next_yr = year if mo < 12 else year + 1
-    month_end = str(date(next_yr, next_mo, 1) - timedelta(days=1))
+    month_end = date(next_yr, next_mo, 1) - timedelta(days=1)
 
     with open(BASE_DIR / "bills.json") as f:
         bills = json.load(f)
 
-    # Fetch 5 extra days before month_start to catch end-of-prior-month transactions
-    # that posted in the first few days of this month, then remap to effective dates.
-    fetch_start = str(date(year, mo, 1) - timedelta(days=5))
-    raw_txns = [dict(r) for r in conn.execute("""
-        SELECT t.name, t.merchant_name, t.date, t.authorized_date, t.amount
-        FROM transactions t
-        JOIN accounts a ON a.account_id = t.account_id
-        WHERE a.subtype = 'checking'
-          AND t.date BETWEEN ? AND ?
-        ORDER BY t.date
-    """, (fetch_start, month_end)).fetchall()]
-    txns = []
-    for t in raw_txns:
-        eff = _txn_effective_date(t)
-        if date(year, mo, 1) <= date.fromisoformat(eff) <= date.fromisoformat(month_end):
-            t["date"] = eff
-            txns.append(t)
+    txns = load_month_transactions(month_start, month_end)
 
     month_key = f"{year:04d}-{mo:02d}"
     manual_paid = get_manual_paid_names(month_key, conn=conn)
     ignored = get_ignored_bill_names(month_key, conn=conn)
 
-    ref = date(year, mo, 1)
+    ref = month_start
 
     result = []
     for b in bills:
@@ -288,12 +273,7 @@ def get_bills_status(month: str = None) -> dict:
             status = "ignored"
             match = None
         else:
-            if due:
-                lo = due - timedelta(days=14)
-                hi = due + timedelta(days=10)
-                windowed = [t for t in txns if lo <= date.fromisoformat(t["date"]) <= hi]
-            else:
-                windowed = txns
+            windowed = txns_near_due(txns, due) if due else txns
             match = find_bill_payment(name, amount, windowed, b.get("keywords"), b.get("min_amount"), b.get("tolerance_pct"))
             status = "paid" if (match or name in manual_paid) else "pending"
         result.append({
@@ -308,8 +288,7 @@ def get_bills_status(month: str = None) -> dict:
         })
 
     # One-time items (manual-paid only, no Plaid detection)
-    ot_ref = date(year, mo, 1)
-    for ot in load_one_time_items(item_type='bill', month_str=month_key, start=ot_ref):
+    for ot in load_one_time_items(item_type='bill', month_str=month_key, start=month_start):
         status = "ignored" if ot[0] in ignored else ("paid" if ot[0] in manual_paid else "pending")
         result.append({
             "name": ot[0],

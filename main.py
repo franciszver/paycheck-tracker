@@ -8,14 +8,17 @@ from email.mime.text import MIMEText
 from pathlib import Path
 from dotenv import load_dotenv
 import holidays
+from plaid.exceptions import ApiException
 from plaid.model.accounts_balance_get_request import AccountsBalanceGetRequest
 from plaid.model.accounts_balance_get_request_options import AccountsBalanceGetRequestOptions
+from plaid.model.accounts_get_request import AccountsGetRequest
 import plaid_client as pc
 from bill_utils import (
     payday_anchor, resolve_due_date, resolve_amount,
     end_of_month, _is_income, bills_due_this_month, income_this_month,
     bill_is_paid, load_one_time_items, _txn_effective_date,
     get_manual_paid_names, get_ignored_bill_names,
+    txns_near_due, load_month_transactions,
 )
 
 SECRETS_FILE = Path.home() / ".config" / "paycheck-tracker" / "secrets.env"
@@ -79,46 +82,6 @@ def income_before_payday(payday, bill_list):
             due.append((b["name"], resolve_amount(b, due_date), due_date))
     due.sort(key=lambda x: x[2])
     return due
-
-
-def txns_near_due(txns, due_date, before=14, after=10):
-    """Filter transactions to a window around the due date."""
-    lo = due_date - timedelta(days=before)
-    hi = due_date + timedelta(days=after)
-    return [t for t in txns if lo <= date.fromisoformat(t["date"]) <= hi]
-
-
-def load_month_transactions(month_start, month_end):
-    """Fetch checking-account transactions for the month using effective transaction dates.
-
-    Fetches 5 extra days before month_start to catch transactions authorized in the
-    prior month but posted in the first few days of this month (e.g. a May 29 charge
-    that posts June 1).  Each transaction's date is replaced with its effective date
-    (authorized_date, CHECKCARD/PURCHASE MMDD, or posted date) before filtering.
-    """
-    if not DB_PATH.exists():
-        return []
-    fetch_start = month_start - timedelta(days=5)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        "SELECT t.name, t.merchant_name, t.category_detailed,"
-        "       t.date, t.authorized_date, t.amount"
-        " FROM transactions t"
-        " JOIN accounts a ON a.account_id = t.account_id"
-        " WHERE a.subtype = 'checking'"
-        "   AND t.date BETWEEN ? AND ?",
-        (str(fetch_start), str(month_end)),
-    ).fetchall()
-    conn.close()
-    result = []
-    for r in rows:
-        txn = dict(r)
-        eff = _txn_effective_date(txn)
-        if month_start <= date.fromisoformat(eff) <= month_end:
-            txn["date"] = eff
-            result.append(txn)
-    return result
 
 
 def paycheck_is_received(pd, txns):
@@ -204,16 +167,23 @@ def send_email(subject, body, config):
 
 def main():
     client = pc.make_client(config)
-    resp = client.accounts_balance_get(
-        AccountsBalanceGetRequest(
-            access_token=pc.access_token(config),
-            options=AccountsBalanceGetRequestOptions(
-                min_last_updated_datetime=datetime.now(timezone.utc),
-            ),
+    try:
+        resp = client.accounts_balance_get(
+            AccountsBalanceGetRequest(
+                access_token=pc.access_token(config),
+                options=AccountsBalanceGetRequestOptions(
+                    min_last_updated_datetime=datetime.now(timezone.utc),
+                ),
+            )
         )
-    )
+    except ApiException:
+        # Plaid couldn't refresh the balance in real time (institution down/slow) —
+        # fall back to the last cached balance rather than aborting the whole email.
+        logging.warning("accounts_balance_get failed, falling back to cached accounts_get")
+        resp = client.accounts_get(AccountsGetRequest(access_token=pc.access_token(config)))
     account = next(a for a in resp["accounts"] if str(a["subtype"]) == "checking")
-    balance = account["balances"]["available"] or account["balances"]["current"]
+    available = account["balances"]["available"]
+    balance = available if available is not None else account["balances"]["current"]
 
     today = date.today()
     month_start = date(today.year, today.month, 1)

@@ -3,7 +3,7 @@ import json
 import os
 import re
 import sqlite3
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
 import discord
@@ -11,6 +11,7 @@ from discord import app_commands
 from bill_utils import (
     bills_due_this_month, income_this_month, load_one_time_items,
     invalidate_amount_override_cache, invalidate_date_override_cache,
+    end_of_month,
 )
 from sync_transactions import init_db
 
@@ -138,10 +139,7 @@ async def askfinance(interaction: discord.Interaction, question: str):
 
 
 def _next_month_start() -> date:
-    today = date.today()
-    nm = today.month + 1 if today.month < 12 else 1
-    ny = today.year if today.month < 12 else today.year + 1
-    return date(ny, nm, 1)
+    return end_of_month(date.today()) + timedelta(days=1)
 
 
 def _month_key(month_start: date) -> str:
@@ -167,18 +165,10 @@ def _bill_names_for_month(current: str, month_start: date) -> list[str]:
 
 
 def _current_month_one_time_names(current: str) -> list[str]:
-    month = date.today().strftime("%Y-%m")
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    try:
-        rows = conn.execute(
-            "SELECT name FROM one_time_items WHERE month=?", (month,)
-        ).fetchall()
-    except sqlite3.OperationalError:
-        conn.close()
-        return []
-    conn.close()
-    names = [r["name"] for r in rows]
+    today = date.today()
+    month = today.strftime("%Y-%m")
+    month_start = date(today.year, today.month, 1)
+    names = [r[0] for r in load_one_time_items(month_str=month, start=month_start)]
     return [n for n in names if current.lower() in n.lower()]
 
 
