@@ -166,7 +166,7 @@ To find your Claude CLI path: `which claude`
 
 ### 7. Configure your bills
 
-Edit `bills.json` to list your actual recurring bills. Each entry needs:
+Edit `bills.json` to list your actual recurring bills. A minimal entry needs:
 
 ```json
 {
@@ -177,7 +177,27 @@ Edit `bills.json` to list your actual recurring bills. Each entry needs:
 }
 ```
 
-You can also run `python3 detect_bills.py` to auto-detect recurring charges from 2 years of transaction history. Review the output carefully before accepting it — it overwrites `bills.json`.
+Optional fields for trickier bills:
+
+```json
+{
+  "name": "Credit Card Payment",
+  "amount": 200.00,
+  "day_of_month": 12,
+  "enabled": true,
+  "keywords": [["big bank"], ["b of a"], ["national bank"]],  ← OR-of-AND transaction-name match groups
+  "min_amount": 150,        ← ignore small unrelated charges that share a keyword
+  "tolerance_pct": 0.05      ← override the default ±10% amount-match tolerance
+}
+```
+
+- `keywords` — a flat list is one AND-group (all keywords must appear in the transaction name/merchant); a list of lists is OR-of-AND, so a bill can match several different statement descriptors. If omitted, matching falls back to the bill's first word or full name.
+- `min_amount` — a floor the matching transaction's amount must clear, useful when two bills share a broad keyword (e.g. two payments both drafted from "big bank").
+- `tolerance_pct` — replaces the default ±10% amount tolerance, e.g. `0.6` for a bill with wildly variable amounts, or `0.02` for one that's always exact.
+- `trigger` — instead of `day_of_month`, use `"1st_paycheck"` or `"2nd_paycheck"` for bills tied to payday rather than a calendar date.
+- `"type": "income"` — marks the entry as an inflow (e.g. a recurring deposit) that offsets bills in the safe-money calculation, instead of a bill.
+
+You can also run `python3 detect_bills.py` to auto-detect recurring charges from 2 years of transaction history. Review the output carefully before accepting it — it overwrites `bills.json` (any bills you added manually will be lost).
 
 ### 8. Configure the MCP server for Claude
 
@@ -262,6 +282,21 @@ In your private Discord server, type:
 
 Claude will call into your local transaction database and respond with real data. No financial data is sent to Discord — Claude processes it locally and only sends you the text answer.
 
+### Managing bills from Discord
+
+Beyond `/askfinance`, the bot exposes slash commands for day-to-day bill management, all restricted to the user IDs in `config.json`'s `discord.allowed_user_ids`:
+
+| Command | What it does |
+|---|---|
+| `/markpaid` / `/unmarkpaid` | Manually mark a bill paid (or undo it) for this month or next — useful when a payment doesn't show up in Plaid yet, or was made through a channel Plaid can't see |
+| `/additem` / `/removeitem` | Add or remove a one-time expense or income item for the current month, without editing `bills.json` |
+| `/ignorebill` / `/unignorebill` | Exclude a bill from safe-money math and payment tracking for a given month, without disabling it permanently |
+| `/movedate` / `/resetdate` | Move a bill's due date to a different day, either just for this month or permanently, and undo it |
+| `/overrideamount` / `/resetamount` | Change a bill's expected amount for this month, next month, or permanently, and undo it |
+| `/recalculate` | Force an immediate transaction resync and resend of the daily balance email |
+
+All of these read/write from `transactions.db` (the tables are created by `sync_transactions.py`, so make sure you've run an initial sync — step 9 below — before using these commands) — they don't touch `bills.json`, so your source-of-truth bill list stays clean.
+
 ---
 
 ## Keeping transactions up to date
@@ -293,6 +328,7 @@ Note: it needs at least 10 months of consistent charges to detect a bill, and it
 | File | What it does |
 |------|-------------|
 | `main.py` | Daily email runner — fetches balance, calculates safe money, sends email |
+| `bill_utils.py` | Shared bill-date/amount resolution and transaction-matching logic used by `main.py`, `mcp_server.py`, and `discord_bot.py` |
 | `sync_transactions.py` | Syncs Plaid transactions to local SQLite database |
 | `mcp_server.py` | MCP server exposing financial query tools to Claude |
 | `discord_bot.py` | Discord bot — receives `/askfinance` commands and calls Claude |

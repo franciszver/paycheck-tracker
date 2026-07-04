@@ -1,11 +1,14 @@
 import json
-import re
 import sqlite3
 import subprocess
 from datetime import date, timedelta
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
+from bill_utils import (
+    find_bill_payment, resolve_due_date, resolve_amount, load_one_time_items,
+    _txn_effective_date, get_manual_paid_names, get_ignored_bill_names,
+)
 
 BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "transactions.db"
@@ -225,7 +228,10 @@ def get_income(days: int = 60) -> list:
 
 @mcp.tool()
 def get_bills_status(month: str = None) -> dict:
-    """Show bills from bills.json and whether matching transactions exist this month."""
+    """Show bills (outflows) from bills.json and whether matching payments exist this month.
+
+    Income/deposits (e.g. Zelle from family, paychecks) are excluded — use get_income for those.
+    """
     conn = get_db()
     if not conn:
         return no_db()
@@ -244,27 +250,76 @@ def get_bills_status(month: str = None) -> dict:
     with open(BASE_DIR / "bills.json") as f:
         bills = json.load(f)
 
+    # Fetch 5 extra days before month_start to catch end-of-prior-month transactions
+    # that posted in the first few days of this month, then remap to effective dates.
+    fetch_start = str(date(year, mo, 1) - timedelta(days=5))
+    raw_txns = [dict(r) for r in conn.execute("""
+        SELECT t.name, t.merchant_name, t.date, t.authorized_date, t.amount
+        FROM transactions t
+        JOIN accounts a ON a.account_id = t.account_id
+        WHERE a.subtype = 'checking'
+          AND t.date BETWEEN ? AND ?
+        ORDER BY t.date
+    """, (fetch_start, month_end)).fetchall()]
+    txns = []
+    for t in raw_txns:
+        eff = _txn_effective_date(t)
+        if date(year, mo, 1) <= date.fromisoformat(eff) <= date.fromisoformat(month_end):
+            t["date"] = eff
+            txns.append(t)
+
+    month_key = f"{year:04d}-{mo:02d}"
+    manual_paid = get_manual_paid_names(month_key, conn=conn)
+    ignored = get_ignored_bill_names(month_key, conn=conn)
+
+    ref = date(year, mo, 1)
+
     result = []
     for b in bills:
         if not b.get("enabled", True):
             continue
+        if b.get("type") == "income":
+            continue
         name = b["name"]
-        amount = b["amount"]
-        bill_type = b.get("type", "bill")
-        keyword = re.sub(r"\s+\(.*\)", "", name).split()[0].lower()
-        match = conn.execute("""
-            SELECT date, amount FROM transactions
-            WHERE date BETWEEN ? AND ?
-              AND LOWER(COALESCE(merchant_name, name)) LIKE ?
-            ORDER BY date LIMIT 1
-        """, (month_start, month_end, f"%{keyword}%")).fetchone()
+        due = resolve_due_date(b, ref)
+        # Fall back to ref if due is None so permanent amount overrides still apply.
+        amount = resolve_amount(b, due or ref)
+        if name in ignored:
+            status = "ignored"
+            match = None
+        else:
+            if due:
+                lo = due - timedelta(days=14)
+                hi = due + timedelta(days=10)
+                windowed = [t for t in txns if lo <= date.fromisoformat(t["date"]) <= hi]
+            else:
+                windowed = txns
+            match = find_bill_payment(name, amount, windowed, b.get("keywords"), b.get("min_amount"), b.get("tolerance_pct"))
+            status = "paid" if (match or name in manual_paid) else "pending"
         result.append({
             "name": name,
             "expected": amount,
-            "type": bill_type,
-            "status": "paid" if match else "pending",
+            "due_date": str(due) if due else None,
+            "type": b.get("type", "bill"),
+            "status": status,
+            "manual_override": name in manual_paid,
             "paid_date": match["date"] if match else None,
             "paid_amount": round(abs(match["amount"]), 2) if match else None,
+        })
+
+    # One-time items (manual-paid only, no Plaid detection)
+    ot_ref = date(year, mo, 1)
+    for ot in load_one_time_items(item_type='bill', month_str=month_key, start=ot_ref):
+        status = "ignored" if ot[0] in ignored else ("paid" if ot[0] in manual_paid else "pending")
+        result.append({
+            "name": ot[0],
+            "expected": ot[1],
+            "due_date": str(ot[2]),
+            "type": "one-time",
+            "status": status,
+            "manual_override": ot[0] in manual_paid,
+            "paid_date": None,
+            "paid_amount": None,
         })
 
     conn.close()

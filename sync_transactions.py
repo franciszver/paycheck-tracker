@@ -2,11 +2,12 @@ import json
 import os
 import sqlite3
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
 from plaid.model.transactions_sync_request import TransactionsSyncRequest
-from plaid.model.accounts_get_request import AccountsGetRequest
+from plaid.model.accounts_balance_get_request import AccountsBalanceGetRequest
+from plaid.model.accounts_balance_get_request_options import AccountsBalanceGetRequestOptions
 import plaid_client as pc
 
 SECRETS_FILE = Path.home() / ".config" / "paycheck-tracker" / "secrets.env"
@@ -65,12 +66,64 @@ def init_db(conn):
             key     TEXT PRIMARY KEY,
             value   TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS manual_payments (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            bill_name  TEXT NOT NULL,
+            month      TEXT NOT NULL,
+            marked_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(bill_name, month)
+        );
+
+        CREATE TABLE IF NOT EXISTS one_time_items (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            month         TEXT NOT NULL,
+            name          TEXT NOT NULL,
+            amount        REAL NOT NULL,
+            day_of_month  INTEGER NOT NULL,
+            type          TEXT NOT NULL DEFAULT 'bill',
+            created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(month, name)
+        );
+
+        CREATE TABLE IF NOT EXISTS date_overrides (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            bill_name     TEXT NOT NULL,
+            month         TEXT NOT NULL,
+            new_day       INTEGER NOT NULL,
+            created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(bill_name, month)
+        );
+
+        CREATE TABLE IF NOT EXISTS ignored_bills (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            bill_name     TEXT NOT NULL,
+            month         TEXT NOT NULL,
+            created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(bill_name, month)
+        );
+
+        CREATE TABLE IF NOT EXISTS amount_overrides (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            bill_name     TEXT NOT NULL,
+            month         TEXT NOT NULL,
+            new_amount    REAL NOT NULL,
+            created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(bill_name, month)
+        );
     """)
     conn.commit()
 
 
 def sync_accounts(conn, client, token):
-    resp = client.accounts_get(AccountsGetRequest(access_token=token))
+    resp = client.accounts_balance_get(
+        AccountsBalanceGetRequest(
+            access_token=token,
+            options=AccountsBalanceGetRequestOptions(
+                min_last_updated_datetime=datetime.now(timezone.utc),
+            ),
+        )
+    )
     now = datetime.utcnow().isoformat()
     for a in resp["accounts"]:
         b = a["balances"]

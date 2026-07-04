@@ -15,12 +15,36 @@
     "name": "Electric Bill",
     "amount": 85.00,
     "day_of_month": 20,
-    "enabled": true
+    "enabled": true,
+    "keywords": ["electric", "power co"],
+    "tolerance_pct": 0.3
   },
   {
     "name": "Gym",
     "amount": 25.00,
     "day_of_month": 1,
+    "enabled": true
+  },
+  {
+    "name": "Credit Card Payment",
+    "amount": 200.00,
+    "day_of_month": 12,
+    "enabled": true,
+    "keywords": [["big bank"], ["b of a"], ["national bank"]],
+    "min_amount": 150,
+    "tolerance_pct": 0.05
+  },
+  {
+    "name": "Piano Lessons",
+    "amount": 60.00,
+    "trigger": "1st_paycheck",
+    "enabled": true
+  },
+  {
+    "name": "Family Gift (Zelle)",
+    "amount": 100.00,
+    "trigger": "2nd_paycheck",
+    "type": "income",
     "enabled": true
   }
 ]

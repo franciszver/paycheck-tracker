@@ -1,16 +1,22 @@
 import json
 import os
-import re
 import smtplib
 import sqlite3
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from pathlib import Path
 from dotenv import load_dotenv
 import holidays
-from plaid.model.accounts_get_request import AccountsGetRequest
+from plaid.model.accounts_balance_get_request import AccountsBalanceGetRequest
+from plaid.model.accounts_balance_get_request_options import AccountsBalanceGetRequestOptions
 import plaid_client as pc
+from bill_utils import (
+    payday_anchor, resolve_due_date, resolve_amount,
+    end_of_month, _is_income, bills_due_this_month, income_this_month,
+    bill_is_paid, load_one_time_items, _txn_effective_date,
+    get_manual_paid_names, get_ignored_bill_names,
+)
 
 SECRETS_FILE = Path.home() / ".config" / "paycheck-tracker" / "secrets.env"
 load_dotenv(SECRETS_FILE)
@@ -43,92 +49,6 @@ def next_payday(last_friday_str):
     return payday, (payday - today).days
 
 
-def payday_anchor():
-    return date.fromisoformat(config["paycheck"]["last_friday"])
-
-
-def nth_payday_of_month(year, month, n):
-    """Return the nth payday (1-indexed) that falls in the given month, or None."""
-    anchor = payday_anchor()
-    us_holidays = holidays.UnitedStates(years=[year])
-    # walk anchor forward/backward to find paydays in the target month
-    start = date(year, month, 1)
-    # align anchor to nearest payday on or before start
-    p = anchor
-    while p > start:
-        p -= timedelta(days=14)
-    while p < start:
-        p += timedelta(days=14)
-    count = 0
-    while p.month == month and p.year == year:
-        adjusted = p - timedelta(days=1) if p in us_holidays else p
-        count += 1
-        if count == n:
-            return adjusted
-        p += timedelta(days=14)
-    return None
-
-
-def resolve_due_date(b, today):
-    trigger = b.get("trigger")
-    if trigger in ("1st_paycheck", "2nd_paycheck"):
-        n = 1 if trigger == "1st_paycheck" else 2
-        due = nth_payday_of_month(today.year, today.month, n)
-        if due is None or due < today:
-            nm = today.month + 1 if today.month < 12 else 1
-            ny = today.year if today.month < 12 else today.year + 1
-            due = nth_payday_of_month(ny, nm, n)
-        return due
-    due_date = date(today.year, today.month, b["day_of_month"])
-    if due_date < today:
-        nm = today.month + 1 if today.month < 12 else 1
-        ny = today.year if today.month < 12 else today.year + 1
-        due_date = date(ny, nm, b["day_of_month"])
-    return due_date
-
-
-def end_of_month(d):
-    nm = d.month + 1 if d.month < 12 else 1
-    ny = d.year if d.month < 12 else d.year + 1
-    return date(ny, nm, 1) - timedelta(days=1)
-
-
-def _is_income(b):
-    return b.get("type") == "income"
-
-
-def bills_due_this_month(bill_list, start=None):
-    """All bills (not income) through end of month. start defaults to today."""
-    today = date.today()
-    ref = start if start is not None else today
-    window = end_of_month(today)
-    due = []
-    for b in bill_list:
-        if not b.get("enabled", True) or _is_income(b):
-            continue
-        due_date = resolve_due_date(b, ref)
-        if due_date and ref <= due_date <= window:
-            due.append((b["name"], b["amount"], due_date))
-    due.sort(key=lambda x: x[2])
-    return due
-
-
-def income_this_month(bill_list, start=None):
-    """Income entries through end of month. start defaults to today."""
-    today = date.today()
-    ref = start if start is not None else today
-    window = end_of_month(today)
-    due = []
-    for b in bill_list:
-        if not b.get("enabled", True) or not _is_income(b):
-            continue
-        due_date = resolve_due_date(b, ref)
-        if due_date and ref <= due_date <= window:
-            due.append((b["name"], b["amount"], due_date))
-    due.sort(key=lambda x: x[2])
-    return due
-
-
 def bills_due_before_payday(payday, bill_list):
     """Bills due before next paycheck — used for safe money calculation."""
     today = date.today()
@@ -141,7 +61,7 @@ def bills_due_before_payday(payday, bill_list):
             continue
         due_date = resolve_due_date(b, today)
         if due_date and today <= due_date < cutoff:
-            due.append((b["name"], b["amount"], due_date))
+            due.append((b["name"], resolve_amount(b, due_date), due_date))
     due.sort(key=lambda x: x[2])
     return due
 
@@ -156,41 +76,49 @@ def income_before_payday(payday, bill_list):
             continue
         due_date = resolve_due_date(b, today)
         if due_date and today <= due_date < cutoff:
-            due.append((b["name"], b["amount"], due_date))
+            due.append((b["name"], resolve_amount(b, due_date), due_date))
     due.sort(key=lambda x: x[2])
     return due
 
 
+def txns_near_due(txns, due_date, before=14, after=10):
+    """Filter transactions to a window around the due date."""
+    lo = due_date - timedelta(days=before)
+    hi = due_date + timedelta(days=after)
+    return [t for t in txns if lo <= date.fromisoformat(t["date"]) <= hi]
+
+
 def load_month_transactions(month_start, month_end):
-    """Fetch settled checking-account transactions for the month for payment-evidence checks."""
+    """Fetch checking-account transactions for the month using effective transaction dates.
+
+    Fetches 5 extra days before month_start to catch transactions authorized in the
+    prior month but posted in the first few days of this month (e.g. a May 29 charge
+    that posts June 1).  Each transaction's date is replaced with its effective date
+    (authorized_date, CHECKCARD/PURCHASE MMDD, or posted date) before filtering.
+    """
     if not DB_PATH.exists():
         return []
+    fetch_start = month_start - timedelta(days=5)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
-        "SELECT t.name, t.merchant_name, t.category_detailed, t.date, t.amount"
+        "SELECT t.name, t.merchant_name, t.category_detailed,"
+        "       t.date, t.authorized_date, t.amount"
         " FROM transactions t"
         " JOIN accounts a ON a.account_id = t.account_id"
         " WHERE a.subtype = 'checking'"
-        "   AND t.date BETWEEN ? AND ? AND t.pending=0",
-        (str(month_start), str(month_end)),
+        "   AND t.date BETWEEN ? AND ?",
+        (str(fetch_start), str(month_end)),
     ).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
-
-
-def bill_is_paid(name, amount, txns):
-    """True if a checking transaction matches by (keyword + amount ±10%) or full name."""
-    keyword = re.sub(r"\s+\(.*\)", "", name).split()[0].lower()
-    full = name.lower()
-    tolerance = amount * 0.10
-    return any(
-        (keyword in (t["name"] or "").lower() or keyword in (t["merchant_name"] or "").lower())
-        and abs(abs(t["amount"]) - amount) <= tolerance
-        or full in (t["name"] or "").lower()
-        or full in (t["merchant_name"] or "").lower()
-        for t in txns
-    )
+    result = []
+    for r in rows:
+        txn = dict(r)
+        eff = _txn_effective_date(txn)
+        if month_start <= date.fromisoformat(eff) <= month_end:
+            txn["date"] = eff
+            result.append(txn)
+    return result
 
 
 def paycheck_is_received(pd, txns):
@@ -276,8 +204,13 @@ def send_email(subject, body, config):
 
 def main():
     client = pc.make_client(config)
-    resp = client.accounts_get(
-        AccountsGetRequest(access_token=pc.access_token(config))
+    resp = client.accounts_balance_get(
+        AccountsBalanceGetRequest(
+            access_token=pc.access_token(config),
+            options=AccountsBalanceGetRequestOptions(
+                min_last_updated_datetime=datetime.now(timezone.utc),
+            ),
+        )
     )
     account = next(a for a in resp["accounts"] if str(a["subtype"]) == "checking")
     balance = account["balances"]["available"] or account["balances"]["current"]
@@ -289,25 +222,44 @@ def main():
     payday, days_until = next_payday(config["paycheck"]["last_friday"])
     payday_bills = bills_due_before_payday(payday, bills)
     payday_income = income_before_payday(payday, bills)
-    total_due = sum(b[1] for b in payday_bills)
-    total_income_safe = sum(i[1] for i in payday_income)
+
+    month_str = today.strftime("%Y-%m")
+    ignored = get_ignored_bill_names(month_str)
+
+    # One-time items due before next payday (manual-only detection)
+    cutoff = payday + timedelta(days=14) if payday == today else payday
+    ot_bills_safe = [b for b in load_one_time_items('bill') if b[2] < cutoff and b[0] not in ignored]
+    ot_income_safe = [i for i in load_one_time_items('income') if i[2] < cutoff and i[0] not in ignored]
+
+    total_due = sum(b[1] for b in payday_bills if b[0] not in ignored) + sum(b[1] for b in ot_bills_safe)
+    total_income_safe = sum(i[1] for i in payday_income if i[0] not in ignored) + sum(i[1] for i in ot_income_safe)
     safe_money = balance - total_due + total_income_safe
     threshold = config.get("low_balance_threshold", 200)
 
-    # Full-month data for the snapshot list
+    # Full-month data for the snapshot list (recurring + one-time)
     all_bills_month = bills_due_this_month(bills, start=month_start)
     all_income_month = income_this_month(bills, start=month_start)
-    all_income_upcoming = income_this_month(bills)   # today-cutoff for top summary
-    total_month = sum(b[1] for b in all_bills_month)
+    ot_bills_month = load_one_time_items('bill', start=month_start)
+    ot_income_month = load_one_time_items('income', start=month_start)
+    all_income_upcoming = income_this_month(bills) + load_one_time_items('income')
+    total_month = sum(b[1] for b in all_bills_month if b[0] not in ignored) + sum(b[1] for b in ot_bills_month if b[0] not in ignored)
 
     # Payment evidence from the DB
     txns = load_month_transactions(month_start, window)
+    manual_paid = get_manual_paid_names(month_str)
 
     # Build combined chronological monthly snapshot
+    # Status: True=paid, False=pending, None=ignored
     paycheck_net = get_paycheck_net_amount()
     combined = (
-        [("bill", b[0], b[1], b[2], bill_is_paid(b[0], b[1], txns)) for b in all_bills_month]
-        + [("income", i[0], i[1], i[2], bill_is_paid(i[0], i[1], txns)) for i in all_income_month]
+        [("bill", b[0], b[1], b[2], None if b[0] in ignored else (bill_is_paid(b[0], b[1], txns_near_due(txns, b[2]), b[3], b[4], b[5]) or b[0] in manual_paid))
+         for b in all_bills_month]
+        + [("income", i[0], i[1], i[2], None if i[0] in ignored else (bill_is_paid(i[0], i[1], txns_near_due(txns, i[2]), i[3], i[4], i[5]) or i[0] in manual_paid))
+           for i in all_income_month]
+        + [("bill", b[0], b[1], b[2], None if b[0] in ignored else b[0] in manual_paid)
+           for b in ot_bills_month]
+        + [("income", i[0], i[1], i[2], None if i[0] in ignored else i[0] in manual_paid)
+           for i in ot_income_month]
         + [("paycheck", "Paycheck", paycheck_net or 0, pd, paycheck_is_received(pd, txns))
            for pd in paychecks_in_window(month_start, window)]
     )
@@ -316,7 +268,7 @@ def main():
     def fmt_row(row):
         typ, name, amt, dt, paid = row
         ds = dt.strftime("%b %-d")
-        mark = "✓ " if paid else "  "
+        mark = "✓ " if paid else ("~ " if paid is None else "  ")
         if typ == "paycheck":
             return f"{mark}\U0001f4b5 {name} +${amt:,.0f} — {ds}"
         if typ == "income":
